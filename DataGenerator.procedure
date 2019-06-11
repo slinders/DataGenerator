@@ -14,7 +14,7 @@
 		- Only supports tables with a primary key. The primary key should contain
 			at least one column that can hold integer values. Binary data types are not
 			supported at all.
-		- Created with SPS03, not guaranteed to work with older SPs
+		- Created with SPS04, not guaranteed to work with older SPs
 		- The random generated values make compression difficult. Therefore you 
 			will likely see minimal compression. Therefore, don't use this data 
 			generator for a sizing exercise or similar operations.
