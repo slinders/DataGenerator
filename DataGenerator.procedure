@@ -1,0 +1,317 @@
+/*
+	Title: SAP HANA Data generator for initial and delta data sets for individual tables
+	
+	Description: Procedure that inserts, updates, or deletes data of a single table,
+		using mostly set-based operations for high-performance. 
+		Inserts are based on the field definition of the provided table, and contains 
+		randomized data. For example, for an integer field, a random integer value is inserted, and for 
+		a character-based field, a random string of characters is inserted. The 
+		procedure uses the HANA metadata tables to retrieve the table column definition.
+		Record updates or deletions are randomized based on the first column of the 
+		primary key.
+		
+	Limitations: 
+		- Only supports tables with a primary key. The primary key should contain
+			at least one column that can hold integer values. Binary data types are not
+			supported at all.
+		- Created with SPS03, not guaranteed to work with older SPs
+		- The random generated values make compression difficult. Therefore you 
+			will likely see minimal compression. Therefore, don't use this data 
+			generator for a sizing exercise or similar operations.
+		
+	Prerequisites: 
+		- Before starting the procedure, create a sequence with following statement: "create sequence GenerateDataSeq1";
+		
+	Example query used in comments
+		TABLE DEFINITION	
+			CREATE TABLE T1S (A INTEGER, B NVARCHAR(5), C DATE, D TIMESTAMP, PRIMARY KEY (A));
+		
+		INSERT
+			CALL "GenerateData"(
+				IP_SCHEMA_NAME => 'TEST_GENERATEDATA', 
+				IP_TABLE_NAME => 'T1S', 
+				IP_INSERT_NUM_RECORDS => 2, 
+				IP_MAX_STRING_SIZE => 3, 
+				IP_DELETE_NUM_RECORDS => 0, 
+				IP_UPDATE_NUM_RECORDS => 0);
+				
+		UPDATE and DELETE
+			CALL "GenerateData"(
+				IP_SCHEMA_NAME => 'TEST_GENERATEDATA', 
+				IP_TABLE_NAME => 'T1S', 
+				IP_INSERT_NUM_RECORDS => 0, 
+				IP_MAX_STRING_SIZE => 3, 
+				IP_DELETE_NUM_RECORDS => 1, 
+				IP_UPDATE_NUM_RECORDS => 1);
+*/
+
+CREATE OR REPLACE PROCEDURE "GenerateData" (
+		IN ip_schema_name NVARCHAR(256), 
+		IN ip_table_name NVARCHAR(256), 
+		IN ip_insert_num_records INTEGER, --No. of records to insert on top of already resident records.
+		IN ip_max_string_size INTEGER, --Maximum length of generated strings. Additionally, strings are capped by the field length definition.
+		IN ip_delete_num_records INTEGER, --No. of records to be deleted
+		IN ip_update_num_records INTEGER --No. of records to be updated
+)
+	LANGUAGE SQLSCRIPT
+	SQL SECURITY INVOKER
+	AS
+	
+	BEGIN
+
+	/* variables for string generation */
+	DECLARE lv_surrogate_record_counter INTEGER;
+	DECLARE lv_surrogate_table_size INTEGER=1000; --surrogate table that will be self-cross-joined
+
+	/* variables for generating SELECT element for string generation */
+	DECLARE lv_string_alfabet CONSTANT NVARCHAR(53)='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ';
+	DECLARE lv_select_rep_part NVARCHAR(5000);
+	DECLARE lv_select_rep_result NCLOB;
+	DECLARE lv_select_string_count INTEGER;
+
+	/* variables for looping inserts */
+	DECLARE lv_insert_query NCLOB;
+	DECLARE lv_insert_query_start NCLOB;
+	DECLARE lv_insert_query_columns NCLOB;
+	DECLARE lv_insert_query_end NCLOB;
+	DECLARE lv_insert_limit INTEGER;
+	DECLARE lv_insert_counter INTEGER=0;
+	
+	/* variables for deletion and update */
+	DECLARE lv_delete_query NCLOB;
+	DECLARE lv_update_set NCLOB;
+	DECLARE lv_update_query NCLOB;
+	DECLARE lv_primary_key_column NVARCHAR(256);
+
+	/* Cursor for TABLE_COLUMNS, joined with CONSTRAINTS table to indicate the PRIMARY KEY columns */
+	DECLARE CURSOR C_COLUMNS FOR SELECT TC.COLUMN_NAME, TC.POSITION, TC.DATA_TYPE_NAME, TC.OFFSET, TC.LENGTH, TC.SCALE, CON.IS_PRIMARY_KEY 
+	FROM TABLE_COLUMNS TC LEFT JOIN CONSTRAINTS CON ON TC.SCHEMA_NAME=CON.SCHEMA_NAME AND TC.TABLE_NAME=CON.TABLE_NAME AND TC.COLUMN_NAME=CON.COLUMN_NAME 
+	WHERE TC.SCHEMA_NAME=ip_schema_name AND TC.TABLE_NAME=ip_table_name 
+	ORDER BY POSITION ASC;
+	
+	/* Error handler for unsupported data types */
+	DECLARE DATA_TYPE_NOT_OK CONDITION FOR SQL_ERROR_CODE 10001;
+    DECLARE EXIT HANDLER FOR DATA_TYPE_NOT_OK SELECT ::SQL_ERROR_CODE, ::SQL_ERROR_MESSAGE FROM DUMMY;
+	
+	/* 	Generate SELECT clause element for character based columns. Used for insert and update operation. 
+		It concatenates functions for randomly generated single characters, which later are made part of a SELECT query. 
+		Example output based on test query (see header)
+			lv_select_rep_part: 
+				substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1)
+			lv_select_rep_result: 
+				substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+				substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+				substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1)
+	*/
+	lv_select_rep_part = 'substring(''' || lv_string_alfabet || ''',RAND()*' || length(lv_string_alfabet)+1 || ',1)'; 
+	lv_select_rep_result = lv_select_rep_part;
+	FOR lv_select_string_count IN 1 .. ip_max_string_size-1 DO
+		lv_select_rep_result = lv_select_rep_result || ' || ' || lv_select_rep_part;
+	END FOR;
+	
+	/* GENERATE INSERTS */
+	IF ip_insert_num_records > 0 THEN
+	
+		/* 	Create single column (type integer) table and insert numbered values. This table will serve as surrogate to 
+			enable a set-based operation in a later step. The values itself are irrelevant, it is only about the number of rows 
+		*/
+		CREATE LOCAL TEMPORARY COLUMN TABLE #SURROGATE (S1 INTEGER);
+		FOR lv_surrogate_record_counter IN 1.. lv_surrogate_table_size DO
+			INSERT INTO #SURROGATE VALUES (lv_surrogate_record_counter);
+		END FOR;
+	
+		/*	Generate input for each column of the target table, to be used as part of SELECT clause
+			Example output based on test query (see header)
+				lv_insert_query_columns
+					GenerateDataSeq1.nextval,
+					left(
+						substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+						substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+						substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1)
+						,5),
+					add_seconds(now(),-1*100000000*RAND()),
+					add_seconds(now(),-1*100000000*RAND())
+	*/
+		lv_insert_query_columns = '';
+		FOR cur_row AS C_COLUMNS DO
+			IF cur_row.IS_PRIMARY_KEY = 'TRUE' THEN 
+				IF cur_row.DATA_TYPE_NAME = 'DATE' OR cur_row.DATA_TYPE_NAME = 'TIME' OR cur_row.DATA_TYPE_NAME = 'SECONDDATE' OR cur_row.DATA_TYPE_NAME = 'TIMESTAMP' THEN 
+					lv_insert_query_columns = lv_insert_query_columns || '
+						add_seconds(now(),-1*1000*GenerateDataSeq1.nextval)';
+				ELSE
+					lv_insert_query_columns = lv_insert_query_columns || '
+						GenerateDataSeq1.nextval';
+				END IF;
+			ELSEIF cur_row.DATA_TYPE_NAME = 'DATE' OR cur_row.DATA_TYPE_NAME = 'TIME' OR cur_row.DATA_TYPE_NAME = 'SECONDDATE' OR cur_row.DATA_TYPE_NAME = 'TIMESTAMP' THEN 
+				lv_insert_query_columns = lv_insert_query_columns || '
+					add_seconds(now(),-1*100000000*RAND())';
+			ELSEIF cur_row.DATA_TYPE_NAME = 'NVARCHAR' OR cur_row.DATA_TYPE_NAME = 'VARCHAR' OR cur_row.DATA_TYPE_NAME = 'ALPHANUM' OR cur_row.DATA_TYPE_NAME = 'SHORTTEXT' OR cur_row.DATA_TYPE_NAME = 'NCLOB' THEN
+				lv_insert_query_columns = lv_insert_query_columns || '
+					left(' || lv_select_rep_result || ',' || cur_row.length || ')';
+			ELSEIF cur_row.DATA_TYPE_NAME = 'INTEGER' OR cur_row.DATA_TYPE_NAME = 'TINYINT' OR cur_row.DATA_TYPE_NAME = 'SMALLINT' THEN 
+				lv_insert_query_columns = lv_insert_query_columns || '
+					1000000*RAND()';
+			ELSEIF cur_row.DATA_TYPE_NAME = 'BIGINT' OR cur_row.DATA_TYPE_NAME =  'SMALLDECIMAL' OR cur_row.DATA_TYPE_NAME = 'DECIMAL' OR cur_row.DATA_TYPE_NAME = 'REAL' OR cur_row.DATA_TYPE_NAME = 'DOUBLE' THEN 
+				lv_insert_query_columns = lv_insert_query_columns || '
+					ROUND(TO_DECIMAL(1000*RAND()),' || cur_row.SCALE || ')';
+			ELSE 
+				SIGNAL DATA_TYPE_NOT_OK SET MESSAGE_TEXT = 'Data type ' || cur_row.DATA_TYPE_NAME || ' is not supported for data generation';
+			END IF;
+			lv_insert_query_columns = lv_insert_query_columns || ',';--add comma
+		END FOR;
+		lv_insert_query_columns = rtrim(lv_insert_query_columns, ',');--remove last comma
+	
+	
+		/* INSERT records into target table in batches of one million records, or less, if less are defined in the input. The surrogate table is cross-joined with itself, 
+			which, with a record count of 1000, results in a table with one million records. The sequence and functions are executed for row in the surrogate join, 
+			resulting in set-based data generation.
+			Example output based on test query (see header)
+				lv_insert_query
+					INSERT INTO "TEST_GENERATEDATA"."T1S" (
+						SELECT 
+							GenerateDataSeq1.nextval,
+							left(
+								substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+								substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+								substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1)
+								,5),
+							add_seconds(now(),-1*100000000*RAND()),
+							add_seconds(now(),-1*100000000*RAND())			
+						FROM #SURROGATE A CROSS JOIN #SURROGATE B
+						LIMIT 2
+					);'
+		*/
+		WHILE lv_insert_counter < ip_insert_num_records DO
+			IF ip_insert_num_records - lv_insert_counter > 1000000 THEN
+				lv_insert_limit=1000000;
+			ELSE
+				lv_insert_limit = ip_insert_num_records - lv_insert_counter;
+			END IF;
+			lv_insert_counter = lv_insert_counter + lv_insert_limit;
+			lv_insert_query_start = '
+				INSERT INTO "' || ip_schema_name || '"."' || ip_table_name || '" (
+					SELECT ';
+			lv_insert_query_end = '			
+					FROM #SURROGATE A CROSS JOIN #SURROGATE B
+					LIMIT ' || lv_insert_limit || '
+				);
+			';
+			lv_insert_query = lv_insert_query_start || lv_insert_query_columns || lv_insert_query_end;
+			EXEC lv_insert_query;
+			COMMIT; --commit for every million records
+		END WHILE;
+		
+		DROP TABLE #SURROGATE;
+		
+	END IF;
+
+	/* GENERATE UPDATES AND DELETES */
+	IF ip_delete_num_records > 0 OR ip_update_num_records > 0 THEN
+		/* Get first positioned primary key column, which will be the column where the UPDATE and DELETE statements are based on */
+		SELECT TC.COLUMN_NAME INTO lv_primary_key_column 
+				FROM TABLE_COLUMNS TC LEFT JOIN CONSTRAINTS CON ON TC.SCHEMA_NAME=CON.SCHEMA_NAME AND TC.TABLE_NAME=CON.TABLE_NAME AND TC.COLUMN_NAME=CON.COLUMN_NAME 
+				WHERE TC.SCHEMA_NAME=ip_schema_name AND TC.TABLE_NAME=ip_table_name
+				ORDER BY TC.POSITION 
+				LIMIT 1;
+	END IF;
+
+	/* GENERATE DELETES */
+	/* 	DELETE fixed number of random records, based on primary key with lowest position number. The RAND() function is used in 
+			conjunction with a window function, to generate a randomly ordered set, of which only the first X records will be
+			selected for deletion (using limit, based on param ip_delete_num_records, of which value is 1 in example)
+		Example output based on test query (see header)
+			lv_delete_query
+				delete 
+				from "TEST_GENERATEDATA"."T1S" 
+				where "A" IN ( 
+					select "A" from ( 
+						select 
+							row_number() over (order by RAND()*"A") as ROWNUM, 
+							"A" 
+						from "TEST_GENERATEDATA"."T1S" 
+						order by ROWNUM
+					) limit 1
+				)
+	*/
+	IF ip_delete_num_records > 0 THEN
+		lv_delete_query = 'delete from "' || ip_schema_name || '"."' || ip_table_name || '" 
+		where "' || lv_primary_key_column || '" IN ( 
+			select "' || lv_primary_key_column || '" from ( 
+				select 
+					row_number() over (order by RAND()*"' || lv_primary_key_column || '") as ROWNUM, 
+					"' || lv_primary_key_column || '" 
+				from "' || ip_schema_name || '"."' || ip_table_name || '" 
+				order by ROWNUM
+			) limit ' || ip_delete_num_records || '
+		)';
+		EXEC lv_delete_query;
+	END IF;
+	
+
+	/* GENERATE UPDATES AND DELETES */
+	/* UPDATE fixed number of random records */
+	IF ip_update_num_records > 0 THEN
+		
+		/* generate columns for SET part of UPDATE statement
+			Example output based on test query (see header)
+				lv_update_query
+					UPDATE "TEST_GENERATEDATA"."T1S" A set 
+						"B"=left(
+							substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+							substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1) || 
+							substring('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ',RAND()*54,1)
+							,5),
+						"C"=add_seconds(now(),-1*1000000000*RAND()),
+						"D"=add_seconds(now(),-1*1000000000*RAND())
+					from 
+						"TEST_GENERATEDATA"."T1S" A,
+						(
+							select * 
+							from ( 
+								select row_number() over (order by RAND()*"A") as rownum, * 
+								from "TEST_GENERATEDATA"."T1S" 
+								limit 1
+							)
+						) B 
+					where A."A"=B."A";
+		*/
+		lv_update_set = '';
+		FOR cur_row AS C_COLUMNS DO
+			IF cur_row.IS_PRIMARY_KEY IS NULL THEN
+				IF cur_row.DATA_TYPE_NAME = 'DATE' OR cur_row.DATA_TYPE_NAME = 'TIME' OR cur_row.DATA_TYPE_NAME = 'SECONDDATE' OR cur_row.DATA_TYPE_NAME = 'TIMESTAMP' THEN 
+					lv_update_set = lv_update_set || '
+						"' || cur_row.COLUMN_NAME || '"=add_seconds(now(),-1*1000000000*RAND())';
+				ELSEIF cur_row.DATA_TYPE_NAME = 'NVARCHAR' OR cur_row.DATA_TYPE_NAME = 'VARCHAR' OR cur_row.DATA_TYPE_NAME = 'ALPHANUM' OR cur_row.DATA_TYPE_NAME = 'SHORTTEXT' OR cur_row.DATA_TYPE_NAME = 'NCLOB' THEN
+					lv_update_set = lv_update_set || '
+						"' || cur_row.COLUMN_NAME || '"=left(' || lv_select_rep_result || ',' || cur_row.length || ')';
+				ELSEIF cur_row.DATA_TYPE_NAME = 'INTEGER' OR cur_row.DATA_TYPE_NAME = 'TINYINT' OR cur_row.DATA_TYPE_NAME = 'SMALLINT' THEN 
+					lv_update_set = lv_update_set || '
+						"' || cur_row.COLUMN_NAME || '"=1000000*RAND()';
+				ELSEIF cur_row.DATA_TYPE_NAME = 'BIGINT' OR cur_row.DATA_TYPE_NAME =  'SMALLDECIMAL' OR cur_row.DATA_TYPE_NAME = 'DECIMAL' OR cur_row.DATA_TYPE_NAME = 'REAL' OR cur_row.DATA_TYPE_NAME = 'DOUBLE' THEN 
+					lv_update_set = lv_update_set || '
+						"' || cur_row.COLUMN_NAME || '"=ROUND(TO_DECIMAL(1000*RAND()),' || cur_row.SCALE || ')';
+				ELSE 
+					SIGNAL DATA_TYPE_NOT_OK SET MESSAGE_TEXT = 'Data type ' || cur_row.DATA_TYPE_NAME || ' is not supported for data generation';
+				END IF;
+				lv_update_set = lv_update_set || ',';--add comma
+			END IF;
+		END FOR;
+		lv_update_set = rtrim(lv_update_set, ',');--remove last comma
+			
+		lv_update_query = '
+			UPDATE "' || ip_schema_name || '"."' || ip_table_name || '" A set 
+			' || lv_update_set || '
+			from "' || ip_schema_name || '"."' || ip_table_name || '" A, 
+			(
+				select * 
+				from ( 
+					select row_number() over (order by RAND()*"' || lv_primary_key_column || '") as rownum, * 
+					from "' || ip_schema_name || '"."' || ip_table_name || '" 
+					limit ' || ip_update_num_records || '
+				)
+			) B 
+			where A."' || lv_primary_key_column || '"=B."' || lv_primary_key_column || '";';
+		EXEC lv_update_query;
+	END IF;
+	
+END
