@@ -1,6 +1,8 @@
 /*
 	Title: SAP HANA Data generator for initial and delta data sets for individual tables
 	
+	Blog reference: https://blogs.sap.com/2019/06/11/data-generator-for-sap-hana-for-large-initial-and-delta-data-sets/
+	
 	Description: Procedure that inserts, updates, or deletes data of a single table,
 		using mostly set-based operations for high-performance. 
 		Inserts are based on the field definition of the provided table, and contains 
